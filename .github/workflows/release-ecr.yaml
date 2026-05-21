@@ -1,0 +1,68 @@
+---
+# Build and push a multi-arch container image to a Gusto-owned ECR
+# repository whenever a `v*-gusto.*` tag is pushed.
+#
+# Trigger pattern is deliberately distinct from the upstream `v*` tags so this
+# fork can carry Gusto-specific releases (e.g. `v0.3.0-gusto.1`) without
+# interfering with the upstream GitHub-release flow in release.yaml.
+#
+# Requires the AWS account to have an IAM role whose trust policy permits the
+# GitHub OIDC issuer (token.actions.githubusercontent.com) for this repository
+# and tag pattern. The role needs `ecr:GetAuthorizationToken` and ECR
+# push permissions on the target repository.
+name: release-ecr
+on:
+  push:
+    tags:
+      - 'v*-gusto.*'
+permissions:
+  id-token: write
+  contents: read
+env:
+  AWS_REGION: us-west-2
+  AWS_ACCOUNT_ID: '226779328744'
+  ECR_REPOSITORY: platform-orchestrator-rsm
+  # Role provisioned in Gusto AWS (see comment block above). Override at the
+  # repository-secret layer if the actual role name differs.
+  AWS_ROLE_ARN: arn:aws:iam::226779328744:role/github-oidc-resource-state-metrics-publisher
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the codebase
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Compute image tag
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        # Sanitize the tag: only ASCII alphanumerics, dot, dash, underscore.
+        # `git push` already restricts ref names; this is defense in depth.
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$REF_NAME" | grep -Eq '^[A-Za-z0-9._-]+$'; then
+            echo "Refusing to use tag '$REF_NAME': unexpected characters" >&2
+            exit 1
+          fi
+          echo "IMAGE_TAG=${REGISTRY}/${ECR_REPOSITORY}:${REF_NAME}" >> "$GITHUB_ENV"
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE_TAG }}
+          provenance: false

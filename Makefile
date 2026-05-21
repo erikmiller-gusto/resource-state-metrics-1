@@ -163,6 +163,24 @@ $(PROJECT_NAME): $(GO_FILES)
 .PHONY: build
 build: $(PROJECT_NAME)
 
+# Gusto ECR image-publish target. The release-ecr.yaml workflow is the
+# primary publisher; this target lets a maintainer push manually when the
+# workflow can't run (e.g., emergency hotfix from a laptop). Requires AWS
+# credentials with ecr:PutImage on the target repo.
+ECR_REGISTRY ?= 226779328744.dkr.ecr.us-west-2.amazonaws.com
+ECR_REPOSITORY ?= platform-orchestrator-rsm
+PUSH_PLATFORMS ?= linux/amd64,linux/arm64
+
+.PHONY: image_push_ecr
+image_push_ecr:
+	@aws ecr get-login-password --region us-west-2 | \
+	  docker login --username AWS --password-stdin $(ECR_REGISTRY)
+	@docker buildx build \
+	  --platform $(PUSH_PLATFORMS) \
+	  --push \
+	  --tag $(ECR_REGISTRY)/$(ECR_REPOSITORY):$(BUILD_TAG) \
+	  .
+
 ###########
 # Running #
 ###########
