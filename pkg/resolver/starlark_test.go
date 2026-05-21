@@ -649,6 +649,175 @@ families = []
 	}
 }
 
+func TestStarlarkResolver_ParseTime(t *testing.T) {
+	t.Parallel()
+
+	// 2024-01-15T10:30:00Z = 1705314600 Unix seconds
+	script := `
+parsed = parse_time("2024-01-15T10:30:00Z")
+samples = [metric(labels={"kind": "test"}, value=parsed)]
+families = [family(name="parsed_metric", help="Parsed timestamp", kind="gauge", samples=samples)]
+`
+
+	obj := map[string]interface{}{}
+
+	sg := NewStarlarkResolver(klog.NewKlogr(), script, 5*time.Second, 100000)
+
+	families, err := sg.Resolve(obj)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if got, want := families[0].Samples[0].Value, 1705314600.0; got != want {
+		t.Errorf("parse_time returned %f, expected %f", got, want)
+	}
+}
+
+func TestStarlarkResolver_ParseTimeRFC3339Nano(t *testing.T) {
+	t.Parallel()
+
+	// Kubernetes lastTransitionTime is often RFC-3339 with sub-second precision.
+	// Sub-seconds are truncated when returning Unix seconds (1705314600).
+	script := `
+parsed = parse_time("2024-01-15T10:30:00.123456789Z")
+samples = [metric(labels={"kind": "test"}, value=parsed)]
+families = [family(name="parsed_metric", help="Parsed timestamp", kind="gauge", samples=samples)]
+`
+
+	obj := map[string]interface{}{}
+
+	sg := NewStarlarkResolver(klog.NewKlogr(), script, 5*time.Second, 100000)
+
+	families, err := sg.Resolve(obj)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if got, want := families[0].Samples[0].Value, 1705314600.0; got != want {
+		t.Errorf("parse_time returned %f, expected %f", got, want)
+	}
+}
+
+func TestStarlarkResolver_ParseTimeEmpty(t *testing.T) {
+	t.Parallel()
+
+	// Empty string is a legitimate "not set" signal, returns 0.0 (no error).
+	script := `
+parsed = parse_time("")
+samples = [metric(labels={"kind": "test"}, value=parsed)]
+families = [family(name="parsed_metric", help="Parsed timestamp", kind="gauge", samples=samples)]
+`
+
+	obj := map[string]interface{}{}
+
+	sg := NewStarlarkResolver(klog.NewKlogr(), script, 5*time.Second, 100000)
+
+	families, err := sg.Resolve(obj)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if got, want := families[0].Samples[0].Value, 0.0; got != want {
+		t.Errorf("parse_time(\"\") returned %f, expected %f", got, want)
+	}
+}
+
+func TestStarlarkResolver_ParseTimeInvalid(t *testing.T) {
+	t.Parallel()
+
+	// Malformed non-empty input is a real error — fail loudly so script bugs surface.
+	script := `
+parsed = parse_time("not-a-timestamp")
+families = []
+`
+
+	obj := map[string]interface{}{}
+
+	sg := NewStarlarkResolver(klog.NewKlogr(), script, 5*time.Second, 100000)
+
+	_, err := sg.Resolve(obj)
+	if err == nil {
+		t.Fatal("expected error when parsing malformed timestamp, got nil")
+	}
+}
+
+func TestStarlarkResolver_ParseTimeNoArgs(t *testing.T) {
+	t.Parallel()
+
+	script := `
+parsed = parse_time()
+families = []
+`
+
+	obj := map[string]interface{}{}
+
+	sg := NewStarlarkResolver(klog.NewKlogr(), script, 5*time.Second, 100000)
+
+	_, err := sg.Resolve(obj)
+	if err == nil {
+		t.Fatal("expected error when calling parse_time without args, got nil")
+	}
+}
+
+// TestStarlarkResolver_ConditionAgeFilter exercises the production use case:
+// suppress a condition-derived metric until the condition has held its current
+// status for at least `grace` seconds.
+func TestStarlarkResolver_ConditionAgeFilter(t *testing.T) {
+	t.Parallel()
+
+	// past condition (well outside grace) -> emit; recent condition -> suppress.
+	script := `
+grace = 90.0
+samples = []
+for c in obj["status"]["conditions"]:
+    if c["type"] == "Synced" and c["status"] != "True":
+        age = timestamp() - parse_time(c.get("lastTransitionTime", ""))
+        if age < grace:
+            continue
+        samples.append(metric(labels={"reason": c["reason"]}, value=1.0))
+families = [family(name="not_synced", help="not synced", kind="gauge", samples=samples)]
+`
+
+	now := time.Now()
+	old := now.Add(-10 * time.Minute).UTC().Format(time.RFC3339Nano)
+	fresh := now.Add(-10 * time.Second).UTC().Format(time.RFC3339Nano)
+
+	makeObj := func(transitionTime string) map[string]interface{} {
+		return map[string]interface{}{
+			"status": map[string]interface{}{
+				"conditions": []interface{}{
+					map[string]interface{}{
+						"type":               "Synced",
+						"status":             "False",
+						"reason":             "ReconcileError",
+						"lastTransitionTime": transitionTime,
+					},
+				},
+			},
+		}
+	}
+
+	sg := NewStarlarkResolver(klog.NewKlogr(), script, 5*time.Second, 100000)
+
+	families, err := sg.Resolve(makeObj(old))
+	if err != nil {
+		t.Fatalf("unexpected error for old condition: %v", err)
+	}
+
+	if len(families[0].Samples) != 1 {
+		t.Errorf("expected 1 sample for condition older than grace, got %d", len(families[0].Samples))
+	}
+
+	families, err = sg.Resolve(makeObj(fresh))
+	if err != nil {
+		t.Fatalf("unexpected error for fresh condition: %v", err)
+	}
+
+	if len(families[0].Samples) != 0 {
+		t.Errorf("expected 0 samples for condition inside grace, got %d", len(families[0].Samples))
+	}
+}
+
 func TestStarlarkResolver_FileOptions_Set(t *testing.T) {
 	t.Parallel()
 
